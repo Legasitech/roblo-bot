@@ -1,6 +1,3 @@
-"""
-Обёртка над FunPayAPI с патчами багов библиотеки
-"""
 import types as _types
 import time as _time
 from typing import Optional
@@ -15,9 +12,9 @@ import config
 
 
 def _patched_parse_messages(self, json_messages, chat_id,
-                             interlocutor_id: Optional[int] = None,
-                             interlocutor_username: Optional[str] = None,
-                             from_id: int = 0):
+                             interlocutor_id=None,
+                             interlocutor_username=None,
+                             from_id=0):
     messages = []
     ids = {self.id: self.username, 0: "FunPay"}
     badges = {}
@@ -28,18 +25,19 @@ def _patched_parse_messages(self, json_messages, chat_id,
             continue
         author_id = i["author"]
         parser = BeautifulSoup(i["html"], "html.parser")
-        if None in [ids.get(author_id), badges.get(author_id)] and \
-                (author_div := parser.find("div", {"class": "media-user-name"})):
-            if badges.get(author_id) is None:
-                badge = author_div.find("span")
-                badges[author_id] = badge.text if badge else 0
-            if ids.get(author_id) is None:
-                a_tag = author_div.find("a")
-                author = a_tag.text.strip() if a_tag else None
-                ids[author_id] = author
-                if self.chat_id_private(chat_id) and author_id == interlocutor_id and not interlocutor_username:
-                    interlocutor_username = author
-                    ids[interlocutor_id] = interlocutor_username
+        if None in [ids.get(author_id), badges.get(author_id)]:
+            author_div = parser.find("div", {"class": "media-user-name"})
+            if author_div:
+                if badges.get(author_id) is None:
+                    badge = author_div.find("span")
+                    badges[author_id] = badge.text if badge else 0
+                if ids.get(author_id) is None:
+                    a_tag = author_div.find("a")
+                    author = a_tag.text.strip() if a_tag else None
+                    ids[author_id] = author
+                    if self.chat_id_private(chat_id) and author_id == interlocutor_id and not interlocutor_username:
+                        interlocutor_username = author
+                        ids[interlocutor_id] = interlocutor_username
         image_link = None
         message_text = None
         img_a = parser.find("a", {"class": "chat-img-link"})
@@ -50,18 +48,20 @@ def _patched_parse_messages(self, json_messages, chat_id,
                 alert_div = parser.find("div", {"class": "alert alert-with-icon alert-info"})
                 message_text = alert_div.text.strip() if alert_div else None
             else:
-                text_div = parser.find("div", {"class": "chat-msg-text"}) \
-                    or parser.find("div", {"class": "message-text"})
+                text_div = parser.find("div", {"class": "chat-msg-text"})
+                if not text_div:
+                    text_div = parser.find("div", {"class": "message-text"})
                 message_text = text_div.text if text_div else None
         if message_text is None and image_link is None:
-            fallback = parser.get_text(separator=" ", strip=True)
-            message_text = fallback or "[нераспознанное сообщение]"
+            message_text = parser.get_text(separator=" ", strip=True) or "[нераспознанное сообщение]"
         by_bot = False
         if not image_link and message_text.startswith(self.bot_character):
             message_text = message_text.replace(self.bot_character, "", 1)
             by_bot = True
-        message_obj = fp_types.Message(i["id"], message_text, chat_id, interlocutor_username,
-                                        None, author_id, i["html"], image_link, determine_msg_type=False)
+        message_obj = fp_types.Message(
+            i["id"], message_text, chat_id, interlocutor_username,
+            None, author_id, i["html"], image_link, determine_msg_type=False
+        )
         message_obj.by_bot = by_bot
         message_obj.type = MessageTypes.NON_SYSTEM if author_id != 0 else message_obj.get_message_type()
         messages.append(message_obj)
@@ -87,12 +87,8 @@ def _patched_generate_new_message_events(self, chats_data):
             _runner_module.logger.error(e)
         except Exception:
             _runner_module.logger.error(f"Не удалось получить истории чатов {list(chats_data.keys())}.")
-            _runner_module.logger.debug("TRACEBACK", exc_info=True)
             _time.sleep(1)
     else:
-        _runner_module.logger.error(
-            f"Не удалось получить истории чатов {list(chats_data.keys())}: превышено кол-во попыток."
-        )
         return {}
     result = {}
     for cid in chats:
@@ -109,7 +105,8 @@ def _patched_generate_new_message_events(self, chats_data):
                     i.by_bot = True
         stack = _runner_module.MessageEventsStack()
         if not self.last_messages_ids.get(cid):
-            if init_msg_text := self.init_messages.get(cid):
+            init_msg_text = self.init_messages.get(cid)
+            if init_msg_text:
                 del self.init_messages[cid]
                 temp = []
                 for i in reversed(messages):
@@ -134,8 +131,7 @@ Runner.generate_new_message_events = _patched_generate_new_message_events
 
 
 def _patched_method(self, request_method, api_method, headers, payload,
-                    exclude_phpsessid: bool = False, raise_not_200: bool = False):
-    """Заменяет стандартный Account.method — шлёт полный набор cookies"""
+                    exclude_phpsessid=False, raise_not_200=False):
     headers = dict(headers)
     gk = f"golden_key={self.golden_key}"
     php = f"PHPSESSID={self.phpsessid}" if self.phpsessid and not exclude_phpsessid else None
@@ -155,7 +151,7 @@ def _patched_method(self, request_method, api_method, headers, payload,
     response = getattr(requests, request_method)(
         link, headers=headers, data=payload,
         timeout=getattr(self, "requests_timeout", 10),
-        proxies=getattr(self, "proxy", None) or {}
+        proxies=getattr(self, "proxy", None) or {},
     )
     if response.status_code == 403:
         raise fp_exceptions.UnauthorizedError(response)
@@ -164,11 +160,7 @@ def _patched_method(self, request_method, api_method, headers, payload,
     return response
 
 
-def create_account(
-    golden_key: str,
-    user_agent: Optional[str] = None,
-    extra_cookies: Optional[str] = None,
-) -> Account:
+def create_account(golden_key, user_agent=None, extra_cookies=None):
     user_agent = user_agent or config.FUNPAY_USER_AGENT
     extra_cookies = extra_cookies or config.FUNPAY_EXTRA_COOKIES
     acc = Account(golden_key, user_agent=user_agent)
@@ -176,13 +168,3 @@ def create_account(
     acc.method = _types.MethodType(_patched_method, acc)
     acc.get()
     return acc
-
-
-def test_connection(golden_key: str):
-    try:
-        acc = create_account(golden_key)
-        return True, f"Авторизован как {acc.username} (ID: {acc.id})"
-    except fp_exceptions.UnauthorizedError:
-        return False, "Golden Key недействителен или ты вышел из аккаунта в браузере"
-    except Exception as e:
-        return False, str(e)
