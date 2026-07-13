@@ -1,10 +1,9 @@
 """
 🤖 Roblox Seller Bot — Панель управления через Telegram
-(ВЕРСИЯ С УДАЛЕНИЕМ АККАУНТОВ)
+(ИСПРАВЛЕННАЯ ВЕРСИЯ: фикс спама сообщений + фикс битых кнопок)
 """
 import asyncio
 import logging
-import re
 import time
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -42,6 +41,12 @@ funpay_account = None
 email_checker = None
 last_processed_msg_ids = {}
 processed_messages = {}
+pending_tasks = {}  # chat_id -> asyncio.Task, для дебаунса "печатающихся" сообщений
+
+# Настройка дебаунса (в секундах). FunPay иногда шлёт несколько
+# "промежуточных" версий одного сообщения, пока человек печатает —
+# ждём паузы в потоке сообщений, прежде чем обрабатывать последнее.
+DEBOUNCE_SECONDS = 1.5
 
 # ============================================================================
 # FSM STATES
@@ -81,7 +86,7 @@ def settings_menu():
     kb = [
         [KeyboardButton(text="🔑 Настроить FunPay")],
         [KeyboardButton(text="📧 Настроить Gmail")],
-        [KeyboardButton(text="️ Назад")],
+        [KeyboardButton(text="◀️ Назад")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -90,7 +95,7 @@ def back_menu():
 
 def confirm_delete_menu():
     kb = [
-        [KeyboardButton(text="✅ Да, удалить"), KeyboardButton(text=" Отмена")],
+        [KeyboardButton(text="✅ Да, удалить"), KeyboardButton(text="❌ Отмена")],
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -189,7 +194,7 @@ async def settings_cmd(message: types.Message):
         return
     await message.answer("⚙️ Настройки бота:", reply_markup=settings_menu())
 
-@dp.message(F.text == "️ Назад")
+@dp.message(F.text == "◀️ Назад")
 async def back_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
@@ -203,7 +208,7 @@ async def setup_funpay(message: types.Message, state: FSMContext):
         "🔑 Введи <b>Golden Key</b> из Cookie-Editor:\n\n"
         "1️⃣ Установи расширение Cookie-Editor в Chrome\n"
         "2️⃣ Зайди на funpay.com (будь авторизован!)\n"
-        "3️ Открой Cookie-Editor → найди golden_key\n"
+        "3️⃣ Открой Cookie-Editor → найди golden_key\n"
         "4️⃣ Скопируй значение и отправь сюда",
         reply_markup=back_menu(),
         parse_mode="HTML"
@@ -274,7 +279,7 @@ async def process_gmail_email(message: types.Message, state: FSMContext):
     await message.answer(
         "✅ Почта сохранена!\n\n"
         "Теперь введи <b>App Password</b> (16-значный код):\n\n"
-        " Как получить:\n"
+        "📋 Как получить:\n"
         "1️⃣ myaccount.google.com → Безопасность\n"
         "2️⃣ Включи Двухфакторную аутентификацию\n"
         "3️⃣ Поиск: 'Пароли приложений'\n"
@@ -378,7 +383,7 @@ async def process_password(message: types.Message, state: FSMContext):
 
     await state.update_data(password=password, email=email)
     await message.answer(
-        f" <b>Проверь данные:</b>\n\n"
+        f"📋 <b>Проверь данные:</b>\n\n"
         f"👤 Логин: <code>{login}</code>\n"
         f"🔑 Пароль: <code>{password}</code>\n"
         f"📧 Email: <code>{email}</code>\n\n"
@@ -430,7 +435,7 @@ async def delete_account_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await message.answer(
-        "️ <b>Удаление аккаунта</b>\n\n"
+        "🗑️ <b>Удаление аккаунта</b>\n\n"
         "Введи <b>ID аккаунта</b> для удаления:\n"
         "Используй команду 📋 Все аккаунты чтобы посмотреть ID",
         reply_markup=back_menu(),
@@ -489,7 +494,7 @@ async def process_delete_confirm(message: types.Message, state: FSMContext):
         return
 
     if message.text != "✅ Да, удалить":
-        await message.answer("️ Нажми одну из кнопок ниже")
+        await message.answer("⚠️ Нажми одну из кнопок ниже")
         return
 
     data = await state.get_data()
@@ -524,25 +529,25 @@ async def stats_cmd(message: types.Message):
     stats = db.get_stats()
     text = "📊 <b>Статистика аккаунтов</b>\n\n"
     for status, count in stats.items():
-        emoji = {"available": "", "sold": "🟡", "transferred": "🔵"}.get(status, "⚪")
+        emoji = {"available": "🟢", "sold": "🟡", "transferred": "🔵"}.get(status, "⚪")
         text += f"{emoji} {status}: <b>{count}</b>\n"
     total = sum(stats.values()) if stats else 0
     text += f"\n📦 Всего: <b>{total}</b>"
     await message.answer(text, parse_mode="HTML")
 
-@dp.message(F.text == " Все аккаунты")
+@dp.message(F.text == "📋 Все аккаунты")
 async def all_accounts_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
     accounts = db.get_all_accounts(limit=20)
     if not accounts:
-        await message.answer(" Аккаунтов пока нет.")
+        await message.answer("📭 Аккаунтов пока нет.")
         return
 
     text = "📋 <b>Последние аккаунты:</b>\n\n"
     for acc in accounts:
         id_, login, password, email, status = acc[:5]
-        emoji = {"available": "", "sold": "🟡", "transferred": "🔵"}.get(status, "⚪")
+        emoji = {"available": "🟢", "sold": "🟡", "transferred": "🔵"}.get(status, "⚪")
         text += f"{emoji} <b>#{id_}</b> | <code>{login}</code>\n"
         text += f"   📧 {email}\n"
         text += f"   📍 {status}\n\n"
@@ -572,7 +577,7 @@ async def find_by_id(message: types.Message):
                 f"{emoji} <b>Аккаунт #{id_}</b>\n\n"
                 f"👤 Логин: <code>{login}</code>\n"
                 f"🔑 Пароль: <code>{password}</code>\n"
-                f" Email: <code>{email}</code>\n"
+                f"📧 Email: <code>{email}</code>\n"
                 f"📍 Статус: {status}",
                 parse_mode="HTML"
             )
@@ -612,11 +617,11 @@ async def test_connections(message: types.Message):
             results.append(f"✅ FunPay: OK ({funpay_account.username}, ID {funpay_account.id})")
         except Exception as e:
             results.append(f"❌ FunPay: {e}")
-            logger.error(f"[TEST]  FunPay error: {e}")
+            logger.error(f"[TEST] ❌ FunPay error: {e}")
     else:
         results.append("⚠️ FunPay: Не настроен")
 
-    await message.answer(" <b>Результаты тестов:</b>\n\n" + "\n".join(results), parse_mode="HTML")
+    await message.answer("🧪 <b>Результаты тестов:</b>\n\n" + "\n".join(results), parse_mode="HTML")
 
 @dp.message(F.text == "📧 Проверить почту")
 async def check_email_cmd(message: types.Message):
@@ -699,43 +704,71 @@ async def funpay_bot_loop(admin_chat_id):
         logger.info(f"[RUNNER] ✅ Аккаунт: {funpay_account.username}")
 
     fp = funpay_account
-
-    def make_runner():
-        fp.runner = None
-        return Runner(fp)
-
-    runner = make_runner()
-    ec = EmailChecker(settings['gmail_email'], settings['gmail_app_password'])
     chat_states = {}
 
     loop = asyncio.get_running_loop()
     fail_count_ref = [0]
 
-    async def process_event(event):
-        global last_processed_msg_ids, processed_messages
+    def make_runner():
+        fp.runner = None
+        return Runner(fp)
+
+    async def debounced_handle(msg):
+        """
+        Ждём паузу в потоке сообщений от одного чата, прежде чем
+        обрабатывать — гасит "промежуточные" версии печатающегося
+        текста, которые FunPay иногда шлёт как отдельные события.
+        """
         try:
-            if event.type == fp_enums.EventTypes.NEW_MESSAGE:
-                msg = event.message
-                if msg is None:
-                    logger.warning("[PROCESS] ⚠️ event.message = None")
-                    return
+            await asyncio.sleep(DEBOUNCE_SECONDS)
+        except asyncio.CancelledError:
+            return  # прилетело более новое сообщение — эту обработку отменяем
 
-                if msg.author_id != fp.id:
-                    msg_id = getattr(msg, 'id', 0)
+        chat_id = msg.chat_id
+        msg_id = getattr(msg, 'id', 0)
 
-                    if msg_id in processed_messages.get(msg.chat_id, set()):
-                        return
+        if msg_id in processed_messages.get(chat_id, set()):
+            return
+        if msg_id <= last_processed_msg_ids.get(chat_id, 0):
+            return
 
-                    if msg_id > last_processed_msg_ids.get(msg.chat_id, 0):
-                        last_processed_msg_ids[msg.chat_id] = msg_id
-                        if msg.chat_id not in processed_messages:
-                            processed_messages[msg.chat_id] = set()
-                        processed_messages[msg.chat_id].add(msg_id)
+        last_processed_msg_ids[chat_id] = msg_id
+        processed_messages.setdefault(chat_id, set()).add(msg_id)
 
-                        logger.info(f"[RUNNER] ✅ Новое | Чат: {msg.chat_id} | От: {msg.author} | Текст: {(msg.text or '')[:50]}")
-                        await handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id)
+        logger.info(f"[RUNNER] ✅ Новое | Чат: {chat_id} | От: {msg.author} | Текст: {(msg.text or '')[:50]}")
+
+        try:
+            await handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id)
         except Exception as e:
             logger.error(f"[PROCESS ERROR] ❌ {e}", exc_info=True)
+
+    async def process_event(event):
+        try:
+            if event.type != fp_enums.EventTypes.NEW_MESSAGE:
+                return
+
+            msg = event.message
+            if msg is None:
+                logger.warning("[PROCESS] ⚠️ event.message = None")
+                return
+
+            if msg.author_id == fp.id:
+                return  # своё же сообщение
+
+            chat_id = msg.chat_id
+
+            # Если по этому чату уже висит отложенная обработка — отменяем
+            # её и ставим новую с актуальным текстом (дебаунс).
+            old_task = pending_tasks.get(chat_id)
+            if old_task and not old_task.done():
+                old_task.cancel()
+
+            pending_tasks[chat_id] = asyncio.create_task(debounced_handle(msg))
+
+        except Exception as e:
+            logger.error(f"[PROCESS ERROR] ❌ {e}", exc_info=True)
+
+    ec = EmailChecker(settings['gmail_email'], settings['gmail_app_password'])
 
     def listen_events(runner_obj, fail_count_ref):
         nonlocal runner
@@ -898,7 +931,7 @@ async def send_payment_reminder(fp, chat_id, buyer_name, order_info, admin_chat_
         )
 
     if await async_send_fp_message(fp, chat_id, reminder_text, admin_chat_id):
-        logger.info(f"[REMINDER]  Отправлено напоминание {buyer_name}")
+        logger.info(f"[REMINDER] 📩 Отправлено напоминание {buyer_name}")
 
 
 async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_chat_id, order_info=None):
@@ -927,9 +960,9 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
             f"📧 Почта: {email}\n\n"
             f"⚠️ ВАЖНО: Смени почту на свою!\n\n"
             f"📖 Инструкция:\n"
-            f"1️ roblox.com → Настройки → Account Info\n"
+            f"1️⃣ roblox.com → Настройки → Account Info\n"
             f"2️⃣ Email Address → Change Email\n"
-            f"3️ Введи СВОЮ почту\n"
+            f"3️⃣ Введи СВОЮ почту\n"
             f"4️⃣ Send Verification Code\n"
             f"5️⃣ Напиши мне \"КОД\" — я пришлю код\n"
             f"6️⃣ Введи код на Roblox\n"
@@ -945,7 +978,7 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
                 f"✅ <b>Аккаунт выдан!</b>\n"
                 f"👤 Покупатель: {buyer_name}\n"
                 f"📦 Аккаунт: #{account_id} ({roblox_login})\n"
-                f" Заказ: {order_id}"
+                f"🧾 Заказ: {order_id}"
             )
 
     except Exception as e:
@@ -983,7 +1016,7 @@ async def send_verification_code(fp, ec, chat_id, account_id, admin_chat_id, cha
             return
 
         target_email = account[3]
-        await async_send_fp_message(fp, chat_id, f" Ищу код верификации для {target_email}... Подожди 10-30 секунд.", admin_chat_id)
+        await async_send_fp_message(fp, chat_id, f"🔍 Ищу код верификации для {target_email}... Подожди 10-30 секунд.", admin_chat_id)
 
         code = await async_find_roblox_code(ec, target_email, timeout=60, check_interval=3)
 
