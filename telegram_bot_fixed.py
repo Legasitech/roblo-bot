@@ -1,19 +1,21 @@
 """
 🤖 Roblox Seller Bot — Панель управления через Telegram
-(ИСПРАВЛЕННАЯ ВЕРСИЯ v2: фикс критических багов + улучшения)
+(ИСПРАВЛЕННАЯ ВЕРСИЯ v3: FSM + Chat States в SQLite, данные не теряются при перезапуске)
 """
 import asyncio
 import logging
 import time
 import re
+import json
 from collections import deque
 from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from bs4 import BeautifulSoup
 
 from FunPayAPI import Runner
@@ -35,23 +37,432 @@ logging.basicConfig(
 logging.getLogger("FunPayAPI").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# SQLITE FSM STORAGE (данные не теряются при перезапуске!)
+# ============================================================================
+class SQLiteStorage(BaseStorage):
+    """Кастомное FSM-хранилище в SQLite вместо MemoryStorage"""
+    
+    def __init__(self, db_path: str = "fsm_storage.db"):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        import sqlite3
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS fsm_data (
+                    key TEXT PRIMARY KEY,
+                    state TEXT,
+                    data TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+    
+    def _make_key(self, key: StorageKey) -> str:
+        return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{key.destiny}"
+    
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        import sqlite3
+        state_str = state.state if isinstance(state, State) else state
+        db_key = self._make_key(key)
+        with sqlite3.connect(self.db_path) as conn:
+            # Получаем текущие data
+            cursor = conn.execute("SELECT data FROM fsm_data WHERE key = ?", (db_key,))
+            row = cursor.fetchone()
+            data = row[0] if row else "{}"
+            
+            if state_str is None:
+                # Удаляем запись если state очищен
+                conn.execute("DELETE FROM fsm_data WHERE key = ?", (db_key,))
+            else:
+                conn.execute(
+                    """INSERT OR REPLACE INTO fsm_data (key, state, data, updated_at) 
+                       VALUES (?, ?, ?, ?)""",
+                    (db_key, state_str, data, datetime.now())
+                )
+            conn.commit()
+    
+    async def get_state(self, key: StorageKey) -> Optional[str]:
+        import sqlite3
+        db_key = self._make_key(key)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT state FROM fsm_data WHERE key = ?", (db_key,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+    
+    async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
+        import sqlite3
+        db_key = self._make_key(key)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT state FROM fsm_data WHERE key = ?", (db_key,))
+            row = cursor.fetchone()
+            state = row[0] if row else None
+            
+            conn.execute(
+                """INSERT OR REPLACE INTO fsm_data (key, state, data, updated_at) 
+                   VALUES (?, ?, ?, ?)""",
+                (db_key, state, json.dumps(data), datetime.now())
+            )
+            conn.commit()
+    
+    async def get_data(self, key: StorageKey) -> Dict[str, Any]:
+        import sqlite3
+        db_key = self._make_key(key)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT data FROM fsm_data WHERE key = ?", (db_key,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                try:
+                    return json.loads(row[0])
+                except json.JSONDecodeError:
+                    return {}
+            return {}
+    
+    async def close(self) -> None:
+        pass
+
+
+# ============================================================================
+# DATABASE — добавляем chat_states таблицу
+# ============================================================================
+class Database:
+    def __init__(self, db_path="accounts.db"):
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.init_db()
+
+    def init_db(self):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Accounts
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='accounts'"
+                )
+                if not cursor.fetchone():
+                    logger.info("[DB] Создаю таблицу accounts...")
+                    cursor.execute("""
+                        CREATE TABLE accounts (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            roblox_login TEXT NOT NULL,
+                            roblox_pass TEXT NOT NULL,
+                            email TEXT UNIQUE NOT NULL,
+                            status TEXT DEFAULT 'available',
+                            sold_to TEXT,
+                            sold_at TIMESTAMP,
+                            funpay_order_id TEXT,
+                            funpay_chat_id TEXT,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                
+                # Orders
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='orders'"
+                )
+                if not cursor.fetchone():
+                    logger.info("[DB] Создаю таблицу orders...")
+                    cursor.execute("""
+                        CREATE TABLE orders (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            funpay_order_id TEXT UNIQUE,
+                            buyer_id TEXT NOT NULL,
+                            buyer_name TEXT,
+                            account_id INTEGER,
+                            status TEXT DEFAULT 'pending',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            completed_at TIMESTAMP,
+                            FOREIGN KEY (account_id) REFERENCES accounts (id)
+                        )
+                    """)
+                
+                # Settings
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='settings'"
+                )
+                if not cursor.fetchone():
+                    logger.info("[DB] Создаю таблицу settings...")
+                    cursor.execute("""
+                        CREATE TABLE settings (
+                            key TEXT PRIMARY KEY,
+                            value TEXT
+                        )
+                    """)
+                
+                # Chat States — НОВАЯ ТАБЛИЦА! Сохраняет стадии диалогов с покупателями
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='chat_states'"
+                )
+                if not cursor.fetchone():
+                    logger.info("[DB] Создаю таблицу chat_states...")
+                    cursor.execute("""
+                        CREATE TABLE chat_states (
+                            chat_id TEXT PRIMARY KEY,
+                            stage TEXT DEFAULT 'new',
+                            account_id INTEGER,
+                            buyer_id TEXT,
+                            buyer_name TEXT,
+                            order_id TEXT,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                
+                # FSM Backup — резервная копия FSM состояний (доп. защита)
+                cursor.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='fsm_backup'"
+                )
+                if not cursor.fetchone():
+                    cursor.execute("""
+                        CREATE TABLE fsm_backup (
+                            user_id TEXT PRIMARY KEY,
+                            state TEXT,
+                            data TEXT,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                
+                conn.commit()
+                logger.info("[DB] База данных готова!")
+
+    # === SETTINGS ===
+    def set_setting(self, key, value):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    (key, value),
+                )
+                conn.commit()
+
+    def get_setting(self, key):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+
+    def get_all_settings(self):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT key, value FROM settings")
+                return dict(cursor.fetchall())
+
+    # === ACCOUNTS ===
+    def add_account(self, roblox_login, roblox_pass, email):
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute(
+                        "INSERT INTO accounts (roblox_login, roblox_pass, email) VALUES (?, ?, ?)",
+                        (roblox_login, roblox_pass, email),
+                    )
+                    conn.commit()
+                    return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def get_available_account(self):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, roblox_login, roblox_pass, email, status "
+                    "FROM accounts WHERE status = 'available' LIMIT 1"
+                )
+                return cursor.fetchone()
+
+    def get_account_by_id(self, account_id):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, roblox_login, roblox_pass, email, status "
+                    "FROM accounts WHERE id = ?",
+                    (account_id,),
+                )
+                return cursor.fetchone()
+
+    def mark_account_sold(self, account_id, buyer_id, funpay_order_id, funpay_chat_id):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE accounts SET status='sold', sold_to=?, sold_at=?, "
+                    "funpay_order_id=?, funpay_chat_id=? WHERE id=?",
+                    (buyer_id, datetime.now(), funpay_order_id, funpay_chat_id, account_id),
+                )
+                conn.commit()
+
+    def mark_account_transferred(self, account_id):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "UPDATE accounts SET status='transferred' WHERE id=?",
+                    (account_id,),
+                )
+                conn.commit()
+
+    def get_account_by_funpay_chat(self, funpay_chat_id):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, roblox_login, roblox_pass, email, status "
+                    "FROM accounts WHERE funpay_chat_id = ?",
+                    (funpay_chat_id,),
+                )
+                return cursor.fetchone()
+
+    def delete_account(self, account_id):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+
+    def get_stats(self):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT status, COUNT(*) FROM accounts GROUP BY status")
+                return dict(cursor.fetchall())
+
+    def get_all_accounts(self, status=None, limit=50):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                if status:
+                    cursor.execute(
+                        "SELECT id, roblox_login, roblox_pass, email, status, sold_to, created_at "
+                        "FROM accounts WHERE status = ? LIMIT ?",
+                        (status, limit),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT id, roblox_login, roblox_pass, email, status, sold_to, created_at "
+                        "FROM accounts LIMIT ?",
+                        (limit,),
+                    )
+                return cursor.fetchall()
+
+    # === ORDERS ===
+    def create_order(self, funpay_order_id, buyer_id, buyer_name, account_id):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO orders "
+                    "(funpay_order_id, buyer_id, buyer_name, account_id) VALUES (?, ?, ?, ?)",
+                    (funpay_order_id, buyer_id, buyer_name, account_id),
+                )
+                conn.commit()
+
+    # === CHAT STATES — НОВЫЕ МЕТОДЫ! ===
+    def get_chat_state(self, chat_id: str) -> Optional[dict]:
+        """Получить стадию диалога с покупателем"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT stage, account_id, buyer_id, buyer_name, order_id "
+                    "FROM chat_states WHERE chat_id = ?",
+                    (str(chat_id),),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return {
+                        "stage": row[0],
+                        "account_id": row[1],
+                        "buyer_id": row[2],
+                        "buyer_name": row[3],
+                        "order_id": row[4],
+                    }
+                return None
+
+    def set_chat_state(self, chat_id: str, stage: str, account_id=None, buyer_id=None, buyer_name=None, order_id=None):
+        """Сохранить стадию диалога с покупателем"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO chat_states 
+                       (chat_id, stage, account_id, buyer_id, buyer_name, order_id, updated_at) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (str(chat_id), stage, account_id, buyer_id, buyer_name, order_id, datetime.now()),
+                )
+                conn.commit()
+
+    def delete_chat_state(self, chat_id: str):
+        """Удалить стадию диалога (например, после завершения)"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM chat_states WHERE chat_id = ?", (str(chat_id),))
+                conn.commit()
+
+    def get_all_chat_states(self) -> Dict[str, dict]:
+        """Получить ВСЕ стадии диалогов (для восстановления после перезапуска)"""
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT chat_id, stage, account_id, buyer_id, buyer_name, order_id FROM chat_states"
+                )
+                result = {}
+                for row in cursor.fetchall():
+                    result[row[0]] = {
+                        "stage": row[1],
+                        "account_id": row[2],
+                        "buyer_id": row[3],
+                        "buyer_name": row[4],
+                        "order_id": row[5],
+                    }
+                return result
+
+    # === FSM BACKUP ===
+    def backup_fsm_state(self, user_id: str, state: str, data: dict):
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO fsm_backup (user_id, state, data, updated_at) VALUES (?, ?, ?, ?)",
+                    (user_id, state, json.dumps(data), datetime.now()),
+                )
+                conn.commit()
+
+    def restore_fsm_state(self, user_id: str) -> Optional[tuple]:
+        with self.lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT state, data FROM fsm_backup WHERE user_id = ?", (user_id,))
+                row = cursor.fetchone()
+                if row:
+                    try:
+                        return row[0], json.loads(row[1])
+                    except json.JSONDecodeError:
+                        return row[0], {}
+                return None
+
+
+# ============================================================================
+# BOT INIT
+# ============================================================================
 bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+dp = Dispatcher(storage=SQLiteStorage(db_path="fsm_storage.db"))  # SQLite вместо Memory!
 db = Database()
 
 # Глобальное состояние
 funpay_account = None
 email_checker = None
 last_processed_msg_ids = {}
-processed_messages = {}  # chat_id -> deque с автоочисткой
-pending_tasks = {}       # chat_id -> asyncio.Task
+processed_messages = {}
+pending_tasks = {}
 
-# Настройка дебаунса (в секундах)
 DEBOUNCE_SECONDS = 1.5
-MAX_PROCESSED_IDS = 200  # Автоочистка старых ID
-NOTIFY_COOLDOWN = 30     # Кулдаун уведомлений админу (сек)
-
-# Кулдаун уведомлений
+MAX_PROCESSED_IDS = 200
+NOTIFY_COOLDOWN = 30
 _last_notify_time = {}
 
 # ============================================================================
@@ -126,7 +537,6 @@ def init_services():
             email_checker = None
 
 async def safe_notify_admin(admin_chat_id: int, text: str, parse_mode: str = "HTML"):
-    """Отправка уведомления админу с кулдауном, чтобы не спамить"""
     now = time.time()
     key = f"{admin_chat_id}:{hash(text[:50])}"
     if now - _last_notify_time.get(key, 0) < NOTIFY_COOLDOWN:
@@ -138,15 +548,10 @@ async def safe_notify_admin(admin_chat_id: int, text: str, parse_mode: str = "HT
         logger.error(f"[NOTIFY] ❌ {e}")
 
 # ============================================================================
-# ПРОВЕРКА ОПЛАТЫ ЧЕРЕЗ API FUNPAY
+# ПРОВЕРКА ОПЛАТЫ
 # ============================================================================
 async def check_order_payment(fp, chat_id, buyer_id):
-    """
-    Проверяет оплату через FunPay API.
-    Ищет заказы покупателя и проверяет статус.
-    """
     try:
-        # Пробуем получить заказы через API
         response = fp.method(
             request_method='get',
             api_method='/orders',
@@ -164,7 +569,6 @@ async def check_order_payment(fp, chat_id, buyer_id):
                         'status': order.get('status', 'paid')
                     }
 
-        # Fallback: проверяем через HTML если API не доступен
         response = fp.method(
             request_method='get',
             api_method='/transactions/sales',
@@ -180,12 +584,10 @@ async def check_order_payment(fp, chat_id, buyer_id):
         if not orders_table:
             return False, None
 
-        for row in orders_table.find_all('tr')[1:]:  # skip header
+        for row in orders_table.find_all('tr')[1:]:
             cells = row.find_all('td')
             if len(cells) < 3:
                 continue
-
-            # Ищем по buyer_id в ссылке на профиль или имени
             row_text = row.get_text()
             if str(buyer_id) in row_text or str(chat_id) in row_text:
                 status_cell = row.find('td', {'class': 'status'})
@@ -208,12 +610,18 @@ async def check_order_payment(fp, chat_id, buyer_id):
 # TELEGRAM COMMAND HANDLERS
 # ============================================================================
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
     if not is_admin(user_id):
         await message.answer("❌ У тебя нет доступа к боту.")
         return
+
+    # Восстанавливаем FSM если было сохранено
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
+        await message.answer("♻️ Предыдущая сессия восстановлена и очищена.")
 
     init_services()
     settings = db.get_all_settings()
@@ -221,6 +629,11 @@ async def cmd_start(message: types.Message):
     status_lines = []
     status_lines.append("✅ FunPay настроен" if settings.get('funpay_key') else "❌ FunPay НЕ настроен")
     status_lines.append("✅ Gmail настроен" if settings.get('gmail_email') else "❌ Gmail НЕ настроен")
+
+    # Показываем сколько активных диалогов
+    chat_states_count = len(db.get_all_chat_states())
+    if chat_states_count > 0:
+        status_lines.append(f"💬 Активных диалогов: {chat_states_count}")
 
     await message.answer(
         f"🎮 <b>Roblox Seller Bot</b>\n\n"
@@ -578,6 +991,14 @@ async def stats_cmd(message: types.Message):
         text += f"{emoji} {status}: <b>{count}</b>\n"
     total = sum(stats.values()) if stats else 0
     text += f"\n📦 Всего: <b>{total}</b>"
+    
+    # Добавляем инфу о диалогах
+    chat_states = db.get_all_chat_states()
+    if chat_states:
+        new_count = sum(1 for s in chat_states.values() if s['stage'] == 'new')
+        delivered_count = sum(1 for s in chat_states.values() if s['stage'] == 'delivered')
+        text += f"\n\n💬 Диалоги: {new_count} новых, {delivered_count} ожидают код"
+    
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "📋 Все аккаунты")
@@ -611,13 +1032,12 @@ async def find_account_cmd(message: types.Message, state: FSMContext):
 
 @dp.message(lambda msg: msg.text and msg.text.isdigit())
 async def find_by_id(message: types.Message, state: FSMContext):
-    """Ищет аккаунт по ID только если пользователь в состоянии ожидания ID"""
     if not is_admin(message.from_user.id):
         return
 
     current_state = await state.get_state()
     if current_state != "find_account_wait_id":
-        return  # Игнорируем цифры в других состояниях
+        return
 
     try:
         acc_id = int(message.text.strip())
@@ -676,6 +1096,13 @@ async def test_connections(message: types.Message):
     else:
         results.append("⚠️ FunPay: Не настроен")
 
+    # Проверяем FSM storage
+    try:
+        states_count = len(db.get_all_chat_states())
+        results.append(f"💬 Сохранено диалогов: {states_count}")
+    except Exception as e:
+        results.append(f"⚠️ Chat states: {e}")
+
     await message.answer("🧪 <b>Результаты тестов:</b>\n\n" + "\n".join(results), parse_mode="HTML")
 
 @dp.message(F.text == "📧 Проверить почту")
@@ -728,7 +1155,6 @@ async def start_funpay_bot(message: types.Message):
         await message.answer("❌ Сначала настрой FunPay в ⚙️ Настройки!")
         return
 
-    # Инициализируем FunPay если ещё не готов
     if funpay_account is None:
         try:
             funpay_account = await asyncio.to_thread(create_account, settings['funpay_key'])
@@ -753,7 +1179,6 @@ async def stop_funpay_bot(message: types.Message):
         _funpay_runner_stop_event.set()
         funpay_task.cancel()
 
-        # Отменяем все pending задачи
         for chat_id, task in list(pending_tasks.items()):
             if not task.done():
                 task.cancel()
@@ -785,7 +1210,19 @@ async def funpay_bot_loop(admin_chat_id):
         logger.info(f"[RUNNER] ✅ Аккаунт: {funpay_account.username}")
 
     fp = funpay_account
-    chat_states = {}
+    
+    # ВОССТАНАВЛИВАЕМ chat_states из БД при перезапуске!
+    chat_states = db.get_all_chat_states()
+    logger.info(f"[RUNNER] ♻️ Восстановлено {len(chat_states)} диалогов из БД")
+    
+    # Отправляем админу инфу о восстановлении
+    if chat_states:
+        await safe_notify_admin(
+            admin_chat_id,
+            f"♻️ <b>Бот перезапущен!</b>\n"
+            f"💬 Восстановлено диалогов: {len(chat_states)}\n"
+            f"Бот продолжит работу с сохранёнными состояниями."
+        )
 
     loop = asyncio.get_running_loop()
     fail_count_ref = [0]
@@ -795,7 +1232,6 @@ async def funpay_bot_loop(admin_chat_id):
         return Runner(fp)
 
     async def debounced_handle(msg):
-        """Дебаунс с автоочисткой старых ID"""
         try:
             await asyncio.sleep(DEBOUNCE_SECONDS)
         except asyncio.CancelledError:
@@ -804,7 +1240,6 @@ async def funpay_bot_loop(admin_chat_id):
         chat_id = msg.chat_id
         msg_id = getattr(msg, 'id', 0)
 
-        # Используем deque вместо set для автоочистки
         if chat_id not in processed_messages:
             processed_messages[chat_id] = deque(maxlen=MAX_PROCESSED_IDS)
 
@@ -823,7 +1258,6 @@ async def funpay_bot_loop(admin_chat_id):
         except Exception as e:
             logger.error(f"[PROCESS ERROR] ❌ {e}", exc_info=True)
         finally:
-            # Чистим задачу из pending
             pending_tasks.pop(chat_id, None)
 
     async def process_event(event):
@@ -837,11 +1271,10 @@ async def funpay_bot_loop(admin_chat_id):
                 return
 
             if msg.author_id == fp.id:
-                return  # своё же сообщение
+                return
 
             chat_id = msg.chat_id
 
-            # Дебаунс: отменяем старую задачу, создаём новую
             old_task = pending_tasks.pop(chat_id, None)
             if old_task and not old_task.done():
                 old_task.cancel()
@@ -851,7 +1284,6 @@ async def funpay_bot_loop(admin_chat_id):
         except Exception as e:
             logger.error(f"[PROCESS ERROR] ❌ {e}", exc_info=True)
 
-    # Используем глобальный email_checker или создаём новый
     ec = email_checker or EmailChecker(settings['gmail_email'], settings['gmail_app_password'])
 
     runner = make_runner()
@@ -939,7 +1371,6 @@ async def handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id):
 
         logger.info(f"[HANDLE] 📨 Чат={chat_id}, от={sender_name}, текст={text[:30]}")
 
-        # Уведомление админу с кулдауном
         await safe_notify_admin(
             admin_chat_id,
             f"💬 <b>Новое сообщение от {sender_name}</b>\n"
@@ -947,15 +1378,38 @@ async def handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id):
             f"📝 Текст: {(msg.text or '')[:100]}"
         )
 
-        state = chat_states.get(chat_id, {"stage": "new", "account_id": None})
+        # Загружаем state из БД (а не только из памяти!)
+        state = chat_states.get(str(chat_id))
+        if state is None:
+            state = db.get_chat_state(str(chat_id))
+            if state:
+                chat_states[str(chat_id)] = state
+                logger.info(f"[HANDLE] ♻️ Восстановлен state для чата {chat_id}: {state['stage']}")
+        
+        if state is None:
+            state = {"stage": "new", "account_id": None}
+            chat_states[str(chat_id)] = state
+            db.set_chat_state(str(chat_id), "new")
 
         try:
             if state["stage"] == "new":
                 account = db.get_account_by_funpay_chat(chat_id)
 
                 if account:
-                    state = {"stage": "delivered", "account_id": account[0]}
-                    chat_states[chat_id] = state
+                    # Восстанавливаем delivered state
+                    new_state = {
+                        "stage": "delivered", 
+                        "account_id": account[0],
+                        "buyer_id": str(sender_id),
+                        "buyer_name": sender_name
+                    }
+                    chat_states[str(chat_id)] = new_state
+                    db.set_chat_state(
+                        str(chat_id), "delivered", 
+                        account_id=account[0],
+                        buyer_id=str(sender_id),
+                        buyer_name=sender_name
+                    )
                     logger.info(f"[HANDLE] ✅ Найден существующий аккаунт #{account[0]}")
 
                     acc_id, login, pwd, email, status = account
@@ -984,13 +1438,31 @@ async def handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id):
                     await send_verification_code(fp, ec, chat_id, state["account_id"], admin_chat_id, chat_states)
                 elif any(w in text for w in ["сменил", "поменял", "готово", "done"]):
                     db.mark_account_transferred(state["account_id"])
+                    
+                    # Обновляем state в БД
+                    db.set_chat_state(str(chat_id), "completed", account_id=state["account_id"])
+                    chat_states[str(chat_id)] = {"stage": "completed", "account_id": state["account_id"]}
+                    
                     await async_send_fp_message(
                         fp, chat_id,
                         "🎉 Отлично! Аккаунт перевязан на твою почту!\n\n"
                         "✅ Теперь аккаунт полностью твой. Спасибо за покупку! 🚀",
                         admin_chat_id
                     )
-                    chat_states[chat_id] = {"stage": "completed", "account_id": state["account_id"]}
+                    await safe_notify_admin(admin_chat_id, f"✅ Аккаунт #{state['account_id']} перевязан!")
+
+            elif state["stage"] == "code_sent":
+                if any(w in text for w in ["сменил", "поменял", "готово", "done"]):
+                    db.mark_account_transferred(state["account_id"])
+                    db.set_chat_state(str(chat_id), "completed", account_id=state["account_id"])
+                    chat_states[str(chat_id)] = {"stage": "completed", "account_id": state["account_id"]}
+                    
+                    await async_send_fp_message(
+                        fp, chat_id,
+                        "🎉 Отлично! Аккаунт перевязан на твою почту!\n\n"
+                        "✅ Теперь аккаунт полностью твой. Спасибо за покупку! 🚀",
+                        admin_chat_id
+                    )
                     await safe_notify_admin(admin_chat_id, f"✅ Аккаунт #{state['account_id']} перевязан!")
 
         except Exception as e:
@@ -1046,6 +1518,22 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
         db.mark_account_sold(account_id, buyer_id, order_id, chat_id)
         db.create_order(order_id, buyer_id, buyer_name, account_id)
 
+        # Сохраняем state в БД
+        db.set_chat_state(
+            str(chat_id), "delivered",
+            account_id=account_id,
+            buyer_id=str(buyer_id),
+            buyer_name=buyer_name,
+            order_id=order_id
+        )
+        chat_states[str(chat_id)] = {
+            "stage": "delivered",
+            "account_id": account_id,
+            "buyer_id": str(buyer_id),
+            "buyer_name": buyer_name,
+            "order_id": order_id
+        }
+
         message = (
             f"🎮 Спасибо за покупку!\n\n"
             f"📋 Данные аккаунта Roblox с Voice Chat:\n"
@@ -1065,7 +1553,6 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
 
         success = await async_send_fp_message(fp, chat_id, message, admin_chat_id)
         if success:
-            chat_states[chat_id] = {"stage": "delivered", "account_id": account_id}
             logger.info(f"[DELIVER] ✅ #{account_id} → {buyer_name} (Заказ: {order_id})")
 
             await safe_notify_admin(
@@ -1082,7 +1569,6 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
 
 
 async def async_send_fp_message(fp, chat_id, text, admin_chat_id, max_retries=3):
-    """Отправка сообщения в FunPay с retry и exponential backoff"""
     for attempt in range(max_retries):
         try:
             result = await asyncio.to_thread(fp.send_message, chat_id, text)
@@ -1094,9 +1580,8 @@ async def async_send_fp_message(fp, chat_id, text, admin_chat_id, max_retries=3)
         except Exception as e:
             logger.error(f"[SEND] ❌ Попытка {attempt + 1}/{max_retries} для чата {chat_id}: {e}")
             if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # exponential backoff: 1, 2, 4 сек
+                await asyncio.sleep(2 ** attempt)
 
-    # Все попытки исчерпаны
     try:
         await bot.send_message(admin_chat_id, f"❌ Не удалось отправить сообщение в FunPay чат {chat_id}")
     except Exception:
@@ -1121,6 +1606,10 @@ async def send_verification_code(fp, ec, chat_id, account_id, admin_chat_id, cha
         code = await async_find_roblox_code(ec, target_email, timeout=60, check_interval=3)
 
         if code:
+            # Сохраняем state
+            db.set_chat_state(str(chat_id), "code_sent", account_id=account_id)
+            chat_states[str(chat_id)] = {"stage": "code_sent", "account_id": account_id}
+            
             await async_send_fp_message(
                 fp, chat_id,
                 f"✅ Код найден!\n\n"
@@ -1129,7 +1618,6 @@ async def send_verification_code(fp, ec, chat_id, account_id, admin_chat_id, cha
                 f"После успешной смены напиши \"СМЕНИЛ\" ✅",
                 admin_chat_id
             )
-            chat_states[chat_id] = {"stage": "code_sent", "account_id": account_id}
             logger.info(f"[CODE] ✅ Код для #{account_id}")
         else:
             await async_send_fp_message(
