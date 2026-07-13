@@ -1,3 +1,6 @@
 aiogram>=3.0.0
 requests>=2.28.0
 beautifulsoup4
+FunPayAPI
+requests 
+lxml
