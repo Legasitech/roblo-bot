@@ -1,10 +1,13 @@
 """
 🤖 Roblox Seller Bot — Панель управления через Telegram
-(ИСПРАВЛЕННАЯ ВЕРСИЯ: фикс спама сообщений + фикс битых кнопок)
+(ИСПРАВЛЕННАЯ ВЕРСИЯ v2: фикс критических багов + улучшения)
 """
 import asyncio
 import logging
 import time
+import re
+from collections import deque
+from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
@@ -40,13 +43,16 @@ db = Database()
 funpay_account = None
 email_checker = None
 last_processed_msg_ids = {}
-processed_messages = {}
-pending_tasks = {}  # chat_id -> asyncio.Task, для дебаунса "печатающихся" сообщений
+processed_messages = {}  # chat_id -> deque с автоочисткой
+pending_tasks = {}       # chat_id -> asyncio.Task
 
-# Настройка дебаунса (в секундах). FunPay иногда шлёт несколько
-# "промежуточных" версий одного сообщения, пока человек печатает —
-# ждём паузы в потоке сообщений, прежде чем обрабатывать последнее.
+# Настройка дебаунса (в секундах)
 DEBOUNCE_SECONDS = 1.5
+MAX_PROCESSED_IDS = 200  # Автоочистка старых ID
+NOTIFY_COOLDOWN = 30     # Кулдаун уведомлений админу (сек)
+
+# Кулдаун уведомлений
+_last_notify_time = {}
 
 # ============================================================================
 # FSM STATES
@@ -119,11 +125,46 @@ def init_services():
             logger.error(f"[INIT] ❌ Email checker error: {e}")
             email_checker = None
 
+async def safe_notify_admin(admin_chat_id: int, text: str, parse_mode: str = "HTML"):
+    """Отправка уведомления админу с кулдауном, чтобы не спамить"""
+    now = time.time()
+    key = f"{admin_chat_id}:{hash(text[:50])}"
+    if now - _last_notify_time.get(key, 0) < NOTIFY_COOLDOWN:
+        return
+    _last_notify_time[key] = now
+    try:
+        await bot.send_message(admin_chat_id, text, parse_mode=parse_mode)
+    except Exception as e:
+        logger.error(f"[NOTIFY] ❌ {e}")
+
 # ============================================================================
 # ПРОВЕРКА ОПЛАТЫ ЧЕРЕЗ API FUNPAY
 # ============================================================================
 async def check_order_payment(fp, chat_id, buyer_id):
+    """
+    Проверяет оплату через FunPay API.
+    Ищет заказы покупателя и проверяет статус.
+    """
     try:
+        # Пробуем получить заказы через API
+        response = fp.method(
+            request_method='get',
+            api_method='/orders',
+            headers={'accept': 'application/json'},
+            payload={'buyer_id': buyer_id, 'status': 'paid'}
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            orders = data.get('orders', [])
+            for order in orders:
+                if str(order.get('chat_id')) == str(chat_id):
+                    return True, {
+                        'id': order.get('id', 'unknown'),
+                        'status': order.get('status', 'paid')
+                    }
+
+        # Fallback: проверяем через HTML если API не доступен
         response = fp.method(
             request_method='get',
             api_method='/transactions/sales',
@@ -139,18 +180,26 @@ async def check_order_payment(fp, chat_id, buyer_id):
         if not orders_table:
             return False, None
 
-        for row in orders_table.find_all('tr'):
-            if str(chat_id) in row.text:
+        for row in orders_table.find_all('tr')[1:]:  # skip header
+            cells = row.find_all('td')
+            if len(cells) < 3:
+                continue
+
+            # Ищем по buyer_id в ссылке на профиль или имени
+            row_text = row.get_text()
+            if str(buyer_id) in row_text or str(chat_id) in row_text:
                 status_cell = row.find('td', {'class': 'status'})
                 if status_cell:
-                    status_text = status_cell.text.strip().lower()
-                    if 'оплачен' in status_text or 'paid' in status_text or 'подтверждён' in status_text:
-                        order_link = row.find('a')
-                        order_id = order_link.get('href', '').split('/')[-1] if order_link else 'unknown'
+                    status_text = status_cell.get_text(strip=True).lower()
+                    if any(s in status_text for s in ['оплачен', 'paid', 'подтверждён', 'confirmed']):
+                        order_link = row.find('a', href=re.compile(r'/orders/'))
+                        order_id = order_link['href'].split('/')[-1] if order_link else 'unknown'
                         return True, {'id': order_id, 'status': status_text}
                     else:
                         return False, {'status': status_text}
+
         return False, None
+
     except Exception as e:
         logger.error(f"[CHECK] ❌ Ошибка проверки оплаты: {e}")
         return False, None
@@ -169,20 +218,13 @@ async def cmd_start(message: types.Message):
     init_services()
     settings = db.get_all_settings()
 
-    status_text = ""
-    if settings.get('funpay_key'):
-        status_text += "✅ FunPay настроен\n"
-    else:
-        status_text += "❌ FunPay НЕ настроен\n"
-
-    if settings.get('gmail_email'):
-        status_text += "✅ Gmail настроен\n"
-    else:
-        status_text += "❌ Gmail НЕ настроен\n"
+    status_lines = []
+    status_lines.append("✅ FunPay настроен" if settings.get('funpay_key') else "❌ FunPay НЕ настроен")
+    status_lines.append("✅ Gmail настроен" if settings.get('gmail_email') else "❌ Gmail НЕ настроен")
 
     await message.answer(
         f"🎮 <b>Roblox Seller Bot</b>\n\n"
-        f"{status_text}\n"
+        f"{'\n'.join(status_lines)}\n\n"
         f"Выбери действие:",
         reply_markup=main_menu(),
         parse_mode="HTML"
@@ -195,9 +237,12 @@ async def settings_cmd(message: types.Message):
     await message.answer("⚙️ Настройки бота:", reply_markup=settings_menu())
 
 @dp.message(F.text == "◀️ Назад")
-async def back_cmd(message: types.Message):
+async def back_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
     await message.answer("Главное меню:", reply_markup=main_menu())
 
 @dp.message(F.text == "🔑 Настроить FunPay")
@@ -554,7 +599,7 @@ async def all_accounts_cmd(message: types.Message):
     await message.answer(text, parse_mode="HTML")
 
 @dp.message(F.text == "🔍 Найти аккаунт")
-async def find_account_cmd(message: types.Message):
+async def find_account_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
     await message.answer(
@@ -562,11 +607,18 @@ async def find_account_cmd(message: types.Message):
         reply_markup=back_menu(),
         parse_mode="HTML"
     )
+    await state.set_state("find_account_wait_id")
 
-@dp.message(F.text.regexp_match(r'^\d+$'))
-async def find_by_id(message: types.Message):
+@dp.message(lambda msg: msg.text and msg.text.isdigit())
+async def find_by_id(message: types.Message, state: FSMContext):
+    """Ищет аккаунт по ID только если пользователь в состоянии ожидания ID"""
     if not is_admin(message.from_user.id):
         return
+
+    current_state = await state.get_state()
+    if current_state != "find_account_wait_id":
+        return  # Игнорируем цифры в других состояниях
+
     try:
         acc_id = int(message.text.strip())
         acc = db.get_account_by_id(acc_id)
@@ -579,12 +631,15 @@ async def find_by_id(message: types.Message):
                 f"🔑 Пароль: <code>{password}</code>\n"
                 f"📧 Email: <code>{email}</code>\n"
                 f"📍 Статус: {status}",
+                reply_markup=main_menu(),
                 parse_mode="HTML"
             )
         else:
-            await message.answer("❌ Аккаунт не найден.")
+            await message.answer("❌ Аккаунт не найден.", reply_markup=main_menu())
     except Exception as e:
         logger.error(f"[FIND] Ошибка: {e}")
+    finally:
+        await state.clear()
 
 @dp.message(F.text == "🧪 Тест подключений")
 async def test_connections(message: types.Message):
@@ -659,34 +714,60 @@ def _count_roblox_emails(checker):
 # FUNPAY BOT RUNNER
 # ============================================================================
 funpay_task = None
+_funpay_runner_stop_event = asyncio.Event()
 
 @dp.message(F.text == "▶️ Запустить FunPay")
 async def start_funpay_bot(message: types.Message):
     if not is_admin(message.from_user.id):
         return
 
-    global funpay_task
+    global funpay_task, funpay_account
     settings = db.get_all_settings()
+
     if not settings.get('funpay_key'):
         await message.answer("❌ Сначала настрой FunPay в ⚙️ Настройки!")
         return
+
+    # Инициализируем FunPay если ещё не готов
+    if funpay_account is None:
+        try:
+            funpay_account = await asyncio.to_thread(create_account, settings['funpay_key'])
+        except Exception as e:
+            await message.answer(f"❌ Не удалось подключиться к FunPay: {e}")
+            return
 
     if funpay_task and not funpay_task.done():
         await message.answer("⚠️ FunPay бот уже запущен!")
         return
 
+    _funpay_runner_stop_event.clear()
     funpay_task = asyncio.create_task(funpay_bot_loop(message.chat.id))
     await message.answer("▶️ <b>FunPay бот запущен!</b>\nСлежу за сообщениями...", parse_mode="HTML")
     logger.info("[RUNNER] ✅ FunPay бот запущен")
 
 @dp.message(F.text == "⏹ Остановить FunPay")
 async def stop_funpay_bot(message: types.Message):
-    global funpay_task, funpay_account
+    global funpay_task, funpay_account, pending_tasks
+
     if funpay_task and not funpay_task.done():
+        _funpay_runner_stop_event.set()
         funpay_task.cancel()
+
+        # Отменяем все pending задачи
+        for chat_id, task in list(pending_tasks.items()):
+            if not task.done():
+                task.cancel()
+        pending_tasks.clear()
+
+        try:
+            await asyncio.wait_for(funpay_task, timeout=5)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+
         funpay_task = None
         if funpay_account:
             funpay_account.runner = None
+
         await message.answer("⏹ <b>FunPay бот остановлен.</b>", parse_mode="HTML")
         logger.info("[RUNNER] ✅ FunPay бот остановлен")
     else:
@@ -714,26 +795,26 @@ async def funpay_bot_loop(admin_chat_id):
         return Runner(fp)
 
     async def debounced_handle(msg):
-        """
-        Ждём паузу в потоке сообщений от одного чата, прежде чем
-        обрабатывать — гасит "промежуточные" версии печатающегося
-        текста, которые FunPay иногда шлёт как отдельные события.
-        """
+        """Дебаунс с автоочисткой старых ID"""
         try:
             await asyncio.sleep(DEBOUNCE_SECONDS)
         except asyncio.CancelledError:
-            return  # прилетело более новое сообщение — эту обработку отменяем
+            return
 
         chat_id = msg.chat_id
         msg_id = getattr(msg, 'id', 0)
 
-        if msg_id in processed_messages.get(chat_id, set()):
+        # Используем deque вместо set для автоочистки
+        if chat_id not in processed_messages:
+            processed_messages[chat_id] = deque(maxlen=MAX_PROCESSED_IDS)
+
+        if msg_id in processed_messages[chat_id]:
             return
         if msg_id <= last_processed_msg_ids.get(chat_id, 0):
             return
 
         last_processed_msg_ids[chat_id] = msg_id
-        processed_messages.setdefault(chat_id, set()).add(msg_id)
+        processed_messages[chat_id].append(msg_id)
 
         logger.info(f"[RUNNER] ✅ Новое | Чат: {chat_id} | От: {msg.author} | Текст: {(msg.text or '')[:50]}")
 
@@ -741,6 +822,9 @@ async def funpay_bot_loop(admin_chat_id):
             await handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id)
         except Exception as e:
             logger.error(f"[PROCESS ERROR] ❌ {e}", exc_info=True)
+        finally:
+            # Чистим задачу из pending
+            pending_tasks.pop(chat_id, None)
 
     async def process_event(event):
         try:
@@ -757,9 +841,8 @@ async def funpay_bot_loop(admin_chat_id):
 
             chat_id = msg.chat_id
 
-            # Если по этому чату уже висит отложенная обработка — отменяем
-            # её и ставим новую с актуальным текстом (дебаунс).
-            old_task = pending_tasks.get(chat_id)
+            # Дебаунс: отменяем старую задачу, создаём новую
+            old_task = pending_tasks.pop(chat_id, None)
             if old_task and not old_task.done():
                 old_task.cancel()
 
@@ -768,14 +851,17 @@ async def funpay_bot_loop(admin_chat_id):
         except Exception as e:
             logger.error(f"[PROCESS ERROR] ❌ {e}", exc_info=True)
 
-    ec = EmailChecker(settings['gmail_email'], settings['gmail_app_password'])
+    # Используем глобальный email_checker или создаём новый
+    ec = email_checker or EmailChecker(settings['gmail_email'], settings['gmail_app_password'])
+
+    runner = make_runner()
 
     def listen_events(runner_obj, fail_count_ref):
-        nonlocal runner
-        runner = runner_obj
-        while True:
+        while not _funpay_runner_stop_event.is_set():
             try:
-                for event in runner.listen(requests_delay=5, ignore_exceptions=False):
+                for event in runner_obj.listen(requests_delay=5, ignore_exceptions=False):
+                    if _funpay_runner_stop_event.is_set():
+                        break
                     asyncio.run_coroutine_threadsafe(process_event(event), loop)
                 fail_count_ref[0] = 0
             except fp_exceptions.RequestFailedError as e:
@@ -783,25 +869,35 @@ async def funpay_bot_loop(admin_chat_id):
                 resp = e.response
                 body_text = resp.text if resp is not None else "<нет тела>"
                 status = resp.status_code if resp is not None else "?"
+
                 logger.warning(f"[RUNNER {status}] ⚠️ Попытка #{fail_count_ref[0]}: {body_text[:800]}")
 
                 asyncio.run_coroutine_threadsafe(
-                    bot.send_message(admin_chat_id, f"⚠️ Runner ошибка {status}\n<code>{body_text[:600]}</code>", parse_mode="HTML"),
+                    safe_notify_admin(admin_chat_id, f"⚠️ Runner ошибка {status}\n<code>{body_text[:600]}</code>"),
                     loop
                 )
 
                 if fail_count_ref[0] >= 3:
                     logger.info("[RUNNER] 🔄 Обновляю сессию...")
-                    asyncio.run_coroutine_threadsafe(bot.send_message(admin_chat_id, "🔄 Обновляю сессию FunPay..."), loop)
+                    asyncio.run_coroutine_threadsafe(
+                        safe_notify_admin(admin_chat_id, "🔄 Обновляю сессию FunPay..."),
+                        loop
+                    )
                     time.sleep(5)
                     try:
                         fp.get(update_phpsessid=True)
-                        runner = make_runner()
-                        asyncio.run_coroutine_threadsafe(bot.send_message(admin_chat_id, f"✅ Сессия обновлена ({fp.username})"), loop)
+                        runner_obj = make_runner()
+                        asyncio.run_coroutine_threadsafe(
+                            safe_notify_admin(admin_chat_id, f"✅ Сессия обновлена ({fp.username})"),
+                            loop
+                        )
                         fail_count_ref[0] = 0
                     except Exception as reconnect_err:
                         logger.error(f"[RUNNER] ❌ Reconnect error: {reconnect_err}")
-                        asyncio.run_coroutine_threadsafe(bot.send_message(admin_chat_id, f"❌ Ошибка обновления: {reconnect_err}"), loop)
+                        asyncio.run_coroutine_threadsafe(
+                            safe_notify_admin(admin_chat_id, f"❌ Ошибка обновления: {reconnect_err}"),
+                            loop
+                        )
                         time.sleep(30)
                 else:
                     time.sleep(10)
@@ -812,7 +908,7 @@ async def funpay_bot_loop(admin_chat_id):
                     time.sleep(5)
                     try:
                         fp.get(update_phpsessid=True)
-                        runner = make_runner()
+                        runner_obj = make_runner()
                         fail_count_ref[0] = 0
                     except Exception as e2:
                         logger.error(f"[RUNNER] ❌ Reconnect failed: {e2}")
@@ -820,13 +916,13 @@ async def funpay_bot_loop(admin_chat_id):
                 else:
                     time.sleep(10)
 
-    runner = make_runner()
     listener_task = loop.run_in_executor(None, listen_events, runner, fail_count_ref)
 
     try:
         await listener_task
     except asyncio.CancelledError:
         logger.info("[RUNNER] ✅ Listener отменён")
+        raise
 
 # ============================================================================
 # FUNPAY MESSAGE HANDLERS
@@ -843,16 +939,13 @@ async def handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id):
 
         logger.info(f"[HANDLE] 📨 Чат={chat_id}, от={sender_name}, текст={text[:30]}")
 
-        try:
-            await bot.send_message(
-                admin_chat_id,
-                f"💬 <b>Новое сообщение от {sender_name}</b>\n"
-                f"💬 Чат: {chat_id}\n"
-                f"📝 Текст: {(msg.text or '')[:100]}",
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            logger.error(f"[HANDLE] ❌ Notify error: {e}")
+        # Уведомление админу с кулдауном
+        await safe_notify_admin(
+            admin_chat_id,
+            f"💬 <b>Новое сообщение от {sender_name}</b>\n"
+            f"💬 Чат: {chat_id}\n"
+            f"📝 Текст: {(msg.text or '')[:100]}"
+        )
 
         state = chat_states.get(chat_id, {"stage": "new", "account_id": None})
 
@@ -898,7 +991,7 @@ async def handle_funpay_message(fp, ec, msg, chat_states, admin_chat_id):
                         admin_chat_id
                     )
                     chat_states[chat_id] = {"stage": "completed", "account_id": state["account_id"]}
-                    await bot.send_message(admin_chat_id, f"✅ Аккаунт #{state['account_id']} перевязан!")
+                    await safe_notify_admin(admin_chat_id, f"✅ Аккаунт #{state['account_id']} перевязан!")
 
         except Exception as e:
             logger.error(f"[HANDLE] ❌ State error: {e}", exc_info=True)
@@ -930,7 +1023,8 @@ async def send_payment_reminder(fp, chat_id, buyer_name, order_info, admin_chat_
             f"❓ Если есть вопросы — пишите!"
         )
 
-    if await async_send_fp_message(fp, chat_id, reminder_text, admin_chat_id):
+    success = await async_send_fp_message(fp, chat_id, reminder_text, admin_chat_id)
+    if success:
         logger.info(f"[REMINDER] 📩 Отправлено напоминание {buyer_name}")
 
 
@@ -969,11 +1063,12 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
             f"7️⃣ Готово! ✅"
         )
 
-        if await async_send_fp_message(fp, chat_id, message, admin_chat_id):
+        success = await async_send_fp_message(fp, chat_id, message, admin_chat_id)
+        if success:
             chat_states[chat_id] = {"stage": "delivered", "account_id": account_id}
             logger.info(f"[DELIVER] ✅ #{account_id} → {buyer_name} (Заказ: {order_id})")
 
-            await bot.send_message(
+            await safe_notify_admin(
                 admin_chat_id,
                 f"✅ <b>Аккаунт выдан!</b>\n"
                 f"👤 Покупатель: {buyer_name}\n"
@@ -986,22 +1081,27 @@ async def deliver_account(fp, chat_id, buyer_id, buyer_name, chat_states, admin_
         await async_send_fp_message(fp, chat_id, "⚠️ Ошибка системы. Обратитесь к администратору.", admin_chat_id)
 
 
-async def async_send_fp_message(fp, chat_id, text, admin_chat_id):
-    try:
-        result = await asyncio.to_thread(fp.send_message, chat_id, text)
-        if result is not None and result:
-            logger.info(f"[SEND] ✅ Сообщение отправлено в чат {chat_id}")
-            return True
-        else:
-            logger.warning(f"[SEND] ⚠️ fp.send_message вернул {result} для чата {chat_id}")
-            return False
-    except Exception as e:
-        logger.error(f"[SEND] ❌ Ошибка отправки в чат {chat_id}: {e}")
+async def async_send_fp_message(fp, chat_id, text, admin_chat_id, max_retries=3):
+    """Отправка сообщения в FunPay с retry и exponential backoff"""
+    for attempt in range(max_retries):
         try:
-            await bot.send_message(admin_chat_id, f"❌ Не удалось отправить сообщение в FunPay: {e}")
-        except Exception:
-            pass
-        return False
+            result = await asyncio.to_thread(fp.send_message, chat_id, text)
+            if result is not None:
+                logger.info(f"[SEND] ✅ Сообщение отправлено в чат {chat_id}")
+                return True
+            else:
+                logger.warning(f"[SEND] ⚠️ fp.send_message вернул None для чата {chat_id}")
+        except Exception as e:
+            logger.error(f"[SEND] ❌ Попытка {attempt + 1}/{max_retries} для чата {chat_id}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # exponential backoff: 1, 2, 4 сек
+
+    # Все попытки исчерпаны
+    try:
+        await bot.send_message(admin_chat_id, f"❌ Не удалось отправить сообщение в FunPay чат {chat_id}")
+    except Exception:
+        pass
+    return False
 
 
 async def async_find_roblox_code(ec, target_email, timeout=60, check_interval=3):
