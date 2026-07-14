@@ -7,6 +7,8 @@ import logging
 import time
 import re
 import json
+import sqlite3
+import threading
 from collections import deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
@@ -22,7 +24,6 @@ from FunPayAPI import Runner
 from FunPayAPI.common import enums as fp_enums
 from FunPayAPI.common import exceptions as fp_exceptions
 
-from database import Database
 from funpay_service import create_account
 from email_checker import EmailChecker
 import config
@@ -48,7 +49,6 @@ class SQLiteStorage(BaseStorage):
         self._init_db()
     
     def _init_db(self):
-        import sqlite3
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS fsm_data (
@@ -64,17 +64,14 @@ class SQLiteStorage(BaseStorage):
         return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{key.destiny}"
     
     async def set_state(self, key: StorageKey, state: StateType = None) -> None:
-        import sqlite3
         state_str = state.state if isinstance(state, State) else state
         db_key = self._make_key(key)
         with sqlite3.connect(self.db_path) as conn:
-            # Получаем текущие data
             cursor = conn.execute("SELECT data FROM fsm_data WHERE key = ?", (db_key,))
             row = cursor.fetchone()
             data = row[0] if row else "{}"
             
             if state_str is None:
-                # Удаляем запись если state очищен
                 conn.execute("DELETE FROM fsm_data WHERE key = ?", (db_key,))
             else:
                 conn.execute(
@@ -85,7 +82,6 @@ class SQLiteStorage(BaseStorage):
             conn.commit()
     
     async def get_state(self, key: StorageKey) -> Optional[str]:
-        import sqlite3
         db_key = self._make_key(key)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("SELECT state FROM fsm_data WHERE key = ?", (db_key,))
@@ -93,7 +89,6 @@ class SQLiteStorage(BaseStorage):
             return row[0] if row else None
     
     async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
-        import sqlite3
         db_key = self._make_key(key)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("SELECT state FROM fsm_data WHERE key = ?", (db_key,))
@@ -108,7 +103,6 @@ class SQLiteStorage(BaseStorage):
             conn.commit()
     
     async def get_data(self, key: StorageKey) -> Dict[str, Any]:
-        import sqlite3
         db_key = self._make_key(key)
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute("SELECT data FROM fsm_data WHERE key = ?", (db_key,))
